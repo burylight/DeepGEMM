@@ -34,6 +34,8 @@ from ._C import (
 try:
     # DeepGEMM Kernels
     from ._C import (
+        # MXFP4 GEMMs
+        mxfp4_gemm_nt,
         # FP8 FP4 GEMMs
         fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
         fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,

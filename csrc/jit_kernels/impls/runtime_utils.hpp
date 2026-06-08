@@ -148,6 +148,39 @@ static CUtensorMap make_tma_2d_desc(const torch::Tensor& t,
     return tensor_map;
 }
 
+static CUtensorMap make_tma_2d_packed_fp4_desc(const torch::Tensor& t,
+                                               int gmem_inner_dim, int gmem_outer_dim,
+                                               int smem_inner_dim, int smem_outer_dim,
+                                               const int& gmem_outer_stride,
+                                               const int& swizzle_mode, const int& swizzle_base = 0) {
+#if CUDA_VERSION >= 12080
+    DG_HOST_ASSERT(t.scalar_type() == kPackedFP4 or t.scalar_type() == torch::kByte);
+    DG_HOST_ASSERT(t.element_size() == 1);
+    if (swizzle_mode != 0)
+        smem_inner_dim = swizzle_mode * 2;
+
+    CUtensorMap tensor_map;
+    const cuuint64_t gmem_dims[2] = {static_cast<cuuint64_t>(gmem_inner_dim), static_cast<cuuint64_t>(gmem_outer_dim)};
+    const cuuint32_t smem_dims[2] = {static_cast<cuuint32_t>(smem_inner_dim), static_cast<cuuint32_t>(smem_outer_dim)};
+    const cuuint64_t gmem_strides[1] = {static_cast<cuuint64_t>(gmem_outer_stride), };
+    const cuuint32_t elem_strides[2] = {1, 1};
+    if (get_env<int>("DG_JIT_DEBUG")) {
+        printf("Making packed FP4 TMA desc: global memory: %d %d, shared memory: %d %d, outer stride bytes: %d, swizzle: %d (base: %d), pointer: %llu\n",
+               gmem_inner_dim, gmem_outer_dim, smem_inner_dim, smem_outer_dim,
+               gmem_outer_stride, swizzle_mode, swizzle_base,
+               reinterpret_cast<unsigned long long>(t.data_ptr()));
+    }
+    DG_CUDA_DRIVER_CHECK(lazy_cuTensorMapEncodeTiled(
+        &tensor_map, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B,
+        2, t.data_ptr(), gmem_dims, gmem_strides, smem_dims, elem_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE, mode_into_tensor_map_swizzle(swizzle_mode, swizzle_base),
+        CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return tensor_map;
+#else
+    DG_HOST_UNREACHABLE("Packed FP4 TMA requires CUDA 12.8 or newer");
+#endif
+}
+
 static CUtensorMap make_tma_3d_desc(const torch::Tensor& t,
                                     int gmem_dim_0, int gmem_dim_1, int gmem_dim_2,
                                     int smem_dim_0, int smem_dim_1, int smem_dim_2,
@@ -224,6 +257,30 @@ static CUtensorMap make_tma_b_desc(const cute::UMMA::Major& major,
                             outer_stride,
                             swizzle_mode, swizzle_base,
                             allow_tf32);
+}
+
+static CUtensorMap make_tma_packed_fp4_a_desc(const torch::Tensor& t,
+                                              const int& shape_m, const int& shape_k,
+                                              const int& block_m, const int& block_k,
+                                              const int& outer_stride,
+                                              const int& swizzle_mode, const int& swizzle_base = 0) {
+    return make_tma_2d_packed_fp4_desc(t,
+                                       shape_k, shape_m,
+                                       block_k, block_m,
+                                       outer_stride,
+                                       swizzle_mode, swizzle_base);
+}
+
+static CUtensorMap make_tma_packed_fp4_b_desc(const torch::Tensor& t,
+                                              const int& shape_n, const int& shape_k,
+                                              const int& block_n, const int& block_k,
+                                              const int& outer_stride,
+                                              const int& swizzle_mode, const int& swizzle_base = 0) {
+    return make_tma_2d_packed_fp4_desc(t,
+                                       shape_k, shape_n,
+                                       block_k, block_n,
+                                       outer_stride,
+                                       swizzle_mode, swizzle_base);
 }
 
 static CUtensorMap make_tma_cd_desc(const torch::Tensor& t,

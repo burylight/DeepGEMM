@@ -89,4 +89,22 @@ copy(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr
     }
 }
 
+template <uint32_t BLOCK_INNER, uint32_t BLOCK_OUTER,
+          uint32_t kSwizzleMode>
+CUTLASS_DEVICE void
+copy_packed_fp4(void const* desc_ptr, cutlass::arch::ClusterTransactionBarrier* barrier_ptr,
+                uint8_t* smem_ptr, const uint32_t& inner_idx, const uint32_t& outer_idx) {
+    constexpr uint32_t BLOCK_INNER_ATOM = kSwizzleMode == 0 ? BLOCK_INNER : kSwizzleMode * 2;
+    constexpr uint32_t BLOCK_INNER_ATOM_BYTES = BLOCK_INNER_ATOM / 2;
+    DG_STATIC_ASSERT(BLOCK_INNER % BLOCK_INNER_ATOM == 0, "Invalid FP4 TMA block shape");
+
+    #pragma unroll
+    for (uint32_t i = 0; i < BLOCK_INNER / BLOCK_INNER_ATOM; ++ i) {
+        cute::SM90_TMA_LOAD_2D::copy(desc_ptr, reinterpret_cast<uint64_t*>(barrier_ptr),
+                                     static_cast<uint64_t>(cute::TMA::CacheHintSm100::EVICT_NORMAL),
+                                     smem_ptr + i * BLOCK_OUTER * BLOCK_INNER_ATOM_BYTES,
+                                     inner_idx + i * BLOCK_INNER_ATOM, outer_idx);
+    }
+}
+
 } // namespace deep_gemm::tma

@@ -3,6 +3,7 @@
 #include <cute/arch/mma_sm100_desc.hpp>
 #include <c10/core/ScalarType.h>
 #include <deep_gemm/common/types.cuh>
+#include <optional>
 
 #include "../../utils/math.hpp"
 
@@ -17,6 +18,7 @@ struct GemmDesc {
     cute::UMMA::Major major_a;
     cute::UMMA::Major major_b;
     bool with_accumulation;
+    std::optional<MmaKind> mma_kind;
 
     // Requirements from users
     int num_sms, tc_util;
@@ -30,12 +32,18 @@ struct GemmDesc {
     int get_expected_num_groups() const { return expected_num_groups > 0 ? expected_num_groups : num_groups; }
 
     MmaKind get_mma_kind() const {
+        if (mma_kind.has_value())
+            return mma_kind.value();
         return a_dtype == torch::kBFloat16 ? MmaKind::BF16 : MmaKind::MXFP8FP4;
     }
 
     void check_validity() const {
-        if (get_mma_kind() == MmaKind::BF16) {
+        const auto inferred_mma_kind = get_mma_kind();
+        if (inferred_mma_kind == MmaKind::BF16) {
             DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
+        } else if (inferred_mma_kind == MmaKind::MXFP4) {
+            DG_HOST_ASSERT((a_dtype == kPackedFP4 or a_dtype == torch::kByte) and
+                           (b_dtype == kPackedFP4 or b_dtype == torch::kByte));
         } else {
             DG_HOST_ASSERT(a_dtype == torch::kFloat8_e4m3fn or a_dtype == kPackedFP4);
             DG_HOST_ASSERT(b_dtype == torch::kFloat8_e4m3fn or b_dtype == kPackedFP4);

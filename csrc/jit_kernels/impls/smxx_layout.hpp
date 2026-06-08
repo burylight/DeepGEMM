@@ -150,7 +150,13 @@ static torch::Tensor get_mn_major_tma_aligned_packed_ue8m0_tensor_torch(const to
     const auto sf_reshaped = (sf.dim() == 2) ? sf.unsqueeze(0) : sf;
 
     // First, convert into UE8M0 `uint8_t`
-    const auto ue8m0_tensor = sf_reshaped.view(torch::kInt32).bitwise_right_shift(23).to(torch::kUInt8);
+    const auto sf_bits = sf_reshaped.view(torch::kInt32);
+    const auto ue8m0_exp = (
+        sf_bits.bitwise_right_shift(23).bitwise_and(0xff) +
+        sf_bits.bitwise_and((1 << 23) - 1).ne(0).to(torch::kInt32)
+    ).clamp(1, 254);
+    const auto ue8m0_tensor = torch::where(
+        sf_bits.ne(0), ue8m0_exp, torch::zeros_like(ue8m0_exp)).to(torch::kUInt8);
 
     // Second, make padded packed tensors
     const auto [num_groups, mn, k] = get_shape<3>(sf_reshaped);

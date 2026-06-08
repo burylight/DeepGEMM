@@ -20,11 +20,27 @@ struct SM100ArchSpec {
         switch (mma_kind) {
             case MmaKind::BF16: return {0, 0};
             case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case MmaKind::MXFP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
+        if (desc.get_mma_kind() == MmaKind::MXFP4) {
+            DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal);
+            DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
+            DG_HOST_ASSERT(not desc.with_accumulation);
+            std::vector<Layout> candidates = {
+                Layout{false, 128, 128, 256, 1, 1},
+                Layout{false, 128, 256, 256, 1, 1},
+            };
+            if (desc.num_sms % 2 == 0 and desc.get_expected_n() >= 256 and
+                ceil_div(desc.get_expected_m(), 128) % 2 == 0) {
+                candidates.push_back(Layout{false, 128, 256, 256, 2, 1});
+            }
+            return candidates;
+        }
+
         // Block K is always in a fixed manner
         const int block_k = 128 / get_element_size(desc.get_mma_kind());
 
@@ -157,6 +173,14 @@ struct SM100ArchSpec {
         const auto store_block_m = layout.swap_ab ? umma_step_n : std::min(layout_ad_m, layout.block_m);
         const auto store_block_n = layout.block_n;
 
+        if (desc.get_mma_kind() == MmaKind::MXFP4) {
+            return {
+                load_block_m, load_block_n,
+                store_block_m, store_block_n,
+                128, 128, get_swizzle_mode(store_block_n, c10::elementSize(desc.cd_dtype))
+            };
+        }
+
         // Decide swizzling by the inner dim
         // TODO: support FP4 sub-byte
         const auto swizzle_mode_a = get_swizzle_mode(
@@ -191,8 +215,12 @@ struct SM100ArchSpec {
 
         // Calculate A/B per stages
         // TODO: consider FP4
-        const int smem_a_per_stage = storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
-        const int smem_b_per_stage = storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
+        const int smem_a_per_stage = desc.get_mma_kind() == MmaKind::MXFP4 ?
+            storage_config.load_block_m * layout.block_k / 2:
+            storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
+        const int smem_b_per_stage = desc.get_mma_kind() == MmaKind::MXFP4 ?
+            storage_config.load_block_n * layout.block_k / 2:
+            storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
 
         // Calculate SF A/B per stages
         int smem_sfa_per_stage = 0;
@@ -200,8 +228,9 @@ struct SM100ArchSpec {
         if (desc.kernel_type == KernelType::Kernel1D1D) {
             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(
                 layout.block_m, layout.block_n, desc.get_mma_kind());
-            smem_sfa_per_stage = sf_block_m * 4;
-            smem_sfb_per_stage = sf_block_n * 4;
+            const int sf_cols_per_stage = desc.get_mma_kind() == MmaKind::MXFP4 ? 2 : 1;
+            smem_sfa_per_stage = sf_block_m * sf_cols_per_stage * 4;
+            smem_sfb_per_stage = sf_block_n * sf_cols_per_stage * 4;
         }
 
         // Calculate stages

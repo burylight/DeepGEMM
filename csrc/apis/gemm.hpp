@@ -7,6 +7,7 @@
 #include "../jit_kernels/impls/sm90_fp8_gemm_1d2d.hpp"
 #include "../jit_kernels/impls/sm90_bf16_gemm.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_gemm_1d1d.hpp"
+#include "../jit_kernels/impls/sm100_mxfp4_gemm_1d1d.hpp"
 #include "../jit_kernels/impls/sm100_bf16_gemm.hpp"
 #endif 
 
@@ -46,6 +47,48 @@ static bool early_return(const int& m, const int &n, const int& k,
 }
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+
+static std::tuple<int, int> check_ab_mxfp4(const torch::Tensor& ab) {
+    const auto [mn, packed_k] = get_shape<2>(ab);
+    DG_HOST_ASSERT(ab.scalar_type() == kPackedFP4 or ab.scalar_type() == torch::kByte);
+    DG_HOST_ASSERT(ab.stride(-1) == 1);
+    DG_HOST_ASSERT(packed_k > 0);
+    return std::make_tuple(mn, packed_k * 2);
+}
+
+static void mxfp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
+                          const std::pair<torch::Tensor, torch::Tensor>& b,
+                          const torch::Tensor& d,
+                          const std::string& compiled_dims) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+
+    const auto major_a = get_major_type_ab(a.first);
+    const auto major_b = get_major_type_ab(b.first);
+    DG_HOST_ASSERT(major_a == cute::UMMA::Major::K and major_b == cute::UMMA::Major::K);
+
+    check_major_type_cd(d);
+
+    const auto [m , k ] = check_ab_mxfp4(a.first);
+    const auto [n , k_] = check_ab_mxfp4(b.first);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_);
+    DG_HOST_ASSERT(k % 256 == 0);
+    DG_HOST_ASSERT(d.scalar_type() == torch::kBFloat16);
+
+    if (m == 0 or n == 0)
+        return;
+
+    std::optional<std::tuple<int, int, int>> recipe = std::nullopt;
+    const auto recipe_a = std::optional<std::tuple<int, int>>(std::make_tuple(1, 32));
+    const auto recipe_b = std::optional<std::tuple<int, int>>(std::make_tuple(1, 32));
+    const auto [sfa, sfb, gran_k_a, gran_k_b] = layout::transform_sf_pair_into_required_layout(
+        a.second, b.second, m, n, k, recipe, recipe_a, recipe_b, std::nullopt, std::nullopt, false);
+    DG_HOST_ASSERT(gran_k_a == 32 and gran_k_b == 32);
+    DG_HOST_ASSERT(sfa.scalar_type() == torch::kInt and sfb.scalar_type() == torch::kInt);
+
+    sm100_mxfp4_gemm_1d1d(a.first, sfa, b.first, sfb, d, m, n, k, compiled_dims);
+}
 
 static void fp8_fp4_gemm_nt(const std::pair<torch::Tensor, torch::Tensor>& a,
                             const std::pair<torch::Tensor, torch::Tensor>& b,
@@ -599,6 +642,11 @@ static void cublaslt_gemm_tt(const torch::Tensor& a, const torch::Tensor& b,
 static void register_apis(pybind11::module_& m) {
 
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
+    // MXFP4 GEMMs
+    m.def("mxfp4_gemm_nt", &mxfp4_gemm_nt,
+          py::arg("a"), py::arg("b"), py::arg("d"),
+          py::arg("compiled_dims") = "");
+
     // FP8 FP4 GEMMs
     m.def("fp8_fp4_gemm_nt", &fp8_fp4_gemm_nt,
           py::arg("a"), py::arg("b"), py::arg("d"),

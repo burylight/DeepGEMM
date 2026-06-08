@@ -7,6 +7,16 @@
 
 namespace deep_gemm {
 
+CUTLASS_DEVICE uint32_t ceil_fp32_bits_to_ue8m0(const uint32_t& value) {
+    if (value == 0)
+        return 0;
+    uint32_t exp = (value >> 23u) & 0xffu;
+    exp += (value & ((1u << 23u) - 1u)) != 0;
+    exp = exp < 1u ? 1u : exp;
+    exp = exp > 254u ? 254u : exp;
+    return exp;
+}
+
 template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
           uint32_t PADDED_SF_K = SF_K + (1 - (SF_K % 2))>
 CUTLASS_GLOBAL void transpose_fp32(const float* sf, float* out, const uint32_t mn) {
@@ -99,10 +109,10 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
 
         // Pack and store
         uint32_t packed = 0;
-        packed |= (values[0] >> 23u);
-        packed |= (values[1] >> 15u);
-        packed |= (values[2] >>  7u);
-        packed |= (values[3] <<  1u);
+        packed |= ceil_fp32_bits_to_ue8m0(values[0]);
+        packed |= ceil_fp32_bits_to_ue8m0(values[1]) << 8u;
+        packed |= ceil_fp32_bits_to_ue8m0(values[2]) << 16u;
+        packed |= ceil_fp32_bits_to_ue8m0(values[3]) << 24u;
         if (const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx; global_mn_idx < mn)
             out[sf_k_pack_idx * tma_aligned_mn + global_mn_idx] = packed;
     }
@@ -178,10 +188,22 @@ CUTLASS_GLOBAL void pack_fp32_into_ue8m0(float* sf, uint32_t* out, uint32_t* ks,
 
         // Pack and store
         uint4 packed;
-        packed.x = (values[0].x >> 23u) | (values[1].x >> 15u) | (values[2].x >> 7u) | (values[3].x << 1u);
-        packed.y = (values[0].y >> 23u) | (values[1].y >> 15u) | (values[2].y >> 7u) | (values[3].y << 1u);
-        packed.z = (values[0].z >> 23u) | (values[1].z >> 15u) | (values[2].z >> 7u) | (values[3].z << 1u);
-        packed.w = (values[0].w >> 23u) | (values[1].w >> 15u) | (values[2].w >> 7u) | (values[3].w << 1u);
+        packed.x = ceil_fp32_bits_to_ue8m0(values[0].x) |
+                   (ceil_fp32_bits_to_ue8m0(values[1].x) << 8u) |
+                   (ceil_fp32_bits_to_ue8m0(values[2].x) << 16u) |
+                   (ceil_fp32_bits_to_ue8m0(values[3].x) << 24u);
+        packed.y = ceil_fp32_bits_to_ue8m0(values[0].y) |
+                   (ceil_fp32_bits_to_ue8m0(values[1].y) << 8u) |
+                   (ceil_fp32_bits_to_ue8m0(values[2].y) << 16u) |
+                   (ceil_fp32_bits_to_ue8m0(values[3].y) << 24u);
+        packed.z = ceil_fp32_bits_to_ue8m0(values[0].z) |
+                   (ceil_fp32_bits_to_ue8m0(values[1].z) << 8u) |
+                   (ceil_fp32_bits_to_ue8m0(values[2].z) << 16u) |
+                   (ceil_fp32_bits_to_ue8m0(values[3].z) << 24u);
+        packed.w = ceil_fp32_bits_to_ue8m0(values[0].w) |
+                   (ceil_fp32_bits_to_ue8m0(values[1].w) << 8u) |
+                   (ceil_fp32_bits_to_ue8m0(values[2].w) << 16u) |
+                   (ceil_fp32_bits_to_ue8m0(values[3].w) << 24u);
         reinterpret_cast<uint4*>(out + packed_sf_k_idx * mn)[mn_idx] = packed;
     }
 }
