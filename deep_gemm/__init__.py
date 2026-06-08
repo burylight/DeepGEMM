@@ -36,6 +36,8 @@ try:
     from ._C import (
         # MXFP4 GEMMs
         mxfp4_gemm_nt,
+        # NVFP4 GEMMs
+        nvfp4_gemm_nt,
         # FP8 FP4 GEMMs
         fp8_fp4_gemm_nt, fp8_fp4_gemm_nn,
         fp8_fp4_gemm_tn, fp8_fp4_gemm_tt,
@@ -72,6 +74,8 @@ try:
         tf32_hc_prenorm_gemm,
         # Layout kernels
         transform_sf_into_required_layout,
+        transform_sf_into_required_layout_nvfp4,
+        get_mn_major_tma_aligned_packed_ue4m3_tensor,
     )
 
     # Some alias for legacy supports

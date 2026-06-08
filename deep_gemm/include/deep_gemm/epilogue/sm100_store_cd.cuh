@@ -134,4 +134,111 @@ sm100_store_cd(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma
     }
 }
 
+template <uint32_t BLOCK_M, uint32_t BLOCK_N,
+          uint32_t STORE_BLOCK_M,
+          uint32_t kNumTMAStoreStages,
+          uint32_t kNumUMMAStoreThreads,
+          GemmType kGemmType,
+          typename cd_dtype_t,
+          typename epilogue_type_t,
+          typename pattern_cd_t>
+CUTLASS_DEVICE void
+sm100_store_cd_bf16_n64_tail_n32(const utils::PatternVisitor<pattern_cd_t>& smem_cd, uint32_t& tma_stage_idx,
+                                 const uint32_t& tmem_base_addr,
+                                 const uint32_t& base_m_idx, const uint32_t& base_n_idx, const uint32_t& batch_idx,
+                                 const uint32_t& epilogue_warp_idx, const uint32_t& lane_idx,
+                                 const cutlass::arch::ClusterTransactionBarrier* tmem_empty_barrier,
+                                 const cute::TmaDescriptor& tensor_map_cd_n64,
+                                 const cute::TmaDescriptor& tensor_map_cd_n32) {
+    constexpr uint32_t kNumBankGroupBytes = 16;
+    constexpr uint32_t kNumElemsPerBankGroup = kNumBankGroupBytes / sizeof(cd_dtype_t);
+    constexpr uint32_t kMainSwizzleCDMode = 128;
+    constexpr uint32_t kTailSwizzleCDMode = 64;
+    constexpr uint32_t kMainStoreBlockN = kMainSwizzleCDMode / sizeof(cd_dtype_t);
+    constexpr uint32_t kTailStoreBlockN = kTailSwizzleCDMode / sizeof(cd_dtype_t);
+    constexpr uint32_t kNumMainStores = BLOCK_N / kMainStoreBlockN;
+    constexpr uint32_t kTailN = BLOCK_N - kNumMainStores * kMainStoreBlockN;
+
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Only support BF16 output");
+    DG_STATIC_ASSERT(kNumElemsPerBankGroup == 8, "Invalid BF16 bank group");
+    DG_STATIC_ASSERT(BLOCK_M % STORE_BLOCK_M == 0, "Invalid block sizes");
+    DG_STATIC_ASSERT(kTailN == kTailStoreBlockN, "Only support a 32-column tail");
+
+    auto advance_store_pipeline = [&]() {
+        tma_stage_idx = (tma_stage_idx + 1) % kNumTMAStoreStages;
+    };
+
+    auto store_one_tile = [&]<uint32_t kStoreBlockN, uint32_t kSwizzleCDMode>(
+        const uint32_t& w, const uint32_t& n_offset, const bool& is_last_store,
+        const cute::TmaDescriptor& tensor_map_cd) {
+        auto smem_base_ptr = reinterpret_cast<uint8_t*>(smem_cd[tma_stage_idx]);
+
+        if (epilogue_warp_idx == 0)
+            cute::tma_store_wait<kNumTMAStoreStages - 1>();
+        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+
+        const auto m_idx = base_m_idx + w * STORE_BLOCK_M;
+        const auto n_idx = epilogue_type_t::template apply_index_n<kStoreBlockN>(base_n_idx + n_offset);
+
+        #pragma unroll
+        for (uint32_t i = 0; i < kStoreBlockN / kNumElemsPerBankGroup; ++ i) {
+            auto bank_group_index = i + lane_idx * (kSwizzleCDMode / kNumBankGroupBytes);
+            constexpr bool kHasShortcut = (kSwizzleCDMode / kNumBankGroupBytes) == 8;
+            auto row = kHasShortcut ? (i / 8 + lane_idx) : (bank_group_index / 8);
+            auto col = kHasShortcut ? (i) : (bank_group_index % 8);
+            col ^= row % (kSwizzleCDMode / 16);
+
+            uint32_t tmem_addr = tmem_base_addr + w * BLOCK_N + n_offset + i * kNumElemsPerBankGroup;
+            auto smem_ptr = smem_base_ptr +
+                            epilogue_warp_idx * 32 * kSwizzleCDMode +
+                            row * (kNumBankGroupBytes * 8) + col * kNumBankGroupBytes;
+
+            uint32_t values[kNumElemsPerBankGroup];
+            cute::SM100_TMEM_LOAD_32dp32b8x::copy(tmem_addr,
+                values[0], values[1], values[2], values[3],
+                values[4], values[5], values[6], values[7]);
+            cutlass::arch::fence_view_async_tmem_load();
+            ptx::st_shared(
+                smem_ptr,
+                math::cast_into_bf16_and_pack(values[0], values[1]),
+                math::cast_into_bf16_and_pack(values[2], values[3]),
+                math::cast_into_bf16_and_pack(values[4], values[5]),
+                math::cast_into_bf16_and_pack(values[6], values[7])
+            );
+        }
+
+        if (is_last_store) {
+            ptx::tcgen05_before_thread_sync();
+            tmem_empty_barrier->arrive(0u);
+        }
+
+        cute::tma_store_fence();
+        cutlass::arch::NamedBarrier::sync(kNumUMMAStoreThreads, 0);
+        if (epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+            if constexpr (kGemmType == GemmType::Batched) {
+                cute::SM90_TMA_STORE_3D::copy(&tensor_map_cd, smem_base_ptr, n_idx, m_idx, batch_idx);
+            } else {
+                cute::SM90_TMA_STORE_2D::copy(&tensor_map_cd, smem_base_ptr, n_idx, m_idx);
+            }
+            cute::tma_store_arrive();
+        }
+        __syncwarp();
+        advance_store_pipeline();
+    };
+
+    constexpr auto kNumMWaves = BLOCK_M / STORE_BLOCK_M;
+    #pragma unroll
+    for (uint32_t w = 0; w < kNumMWaves; ++ w) {
+        #pragma unroll
+        for (uint32_t s = 0; s < kNumMainStores; ++ s) {
+            constexpr uint32_t kMainN = kMainStoreBlockN;
+            const uint32_t n_offset = s * kMainN;
+            store_one_tile.template operator()<kMainStoreBlockN, kMainSwizzleCDMode>(
+                w, n_offset, false, tensor_map_cd_n64);
+        }
+        store_one_tile.template operator()<kTailStoreBlockN, kTailSwizzleCDMode>(
+            w, kNumMainStores * kMainStoreBlockN, w == kNumMWaves - 1, tensor_map_cd_n32);
+    }
+}
+
 } // namespace deep_gemm::epilogue

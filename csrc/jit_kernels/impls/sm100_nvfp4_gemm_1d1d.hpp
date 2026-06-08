@@ -15,7 +15,7 @@
 
 namespace deep_gemm {
 
-class SM100MXFP4Gemm1D1DRuntime final: public LaunchRuntime<SM100MXFP4Gemm1D1DRuntime> {
+class SM100NVFP4Gemm1D1DRuntime final: public LaunchRuntime<SM100NVFP4Gemm1D1DRuntime> {
 public:
     struct Args {
         GemmDesc gemm_desc;
@@ -27,18 +27,17 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_sfa;
         CUtensorMap tensor_map_sfb;
-        CUtensorMap tensor_map_cd_n64;
         CUtensorMap tensor_map_cd;
     };
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
-#include <deep_gemm/impls/sm100_mxfp4_gemm_1d1d.cuh>
+#include <deep_gemm/impls/sm100_nvfp4_gemm_1d1d.cuh>
 
 using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&sm100_mxfp4_gemm_1d1d_impl<
+    auto ptr = reinterpret_cast<void*>(&sm100_nvfp4_gemm_1d1d_impl<
         {}, {}, {},
         {}, {}, {},
         {}, {}, {},
@@ -69,12 +68,11 @@ static void __instantiate_kernel() {{
             args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k,
             args.tensor_map_a, args.tensor_map_b,
             args.tensor_map_sfa, args.tensor_map_sfb,
-            args.tensor_map_cd_n64,
             args.tensor_map_cd));
     }
 };
 
-static void sm100_mxfp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
+static void sm100_nvfp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& sfa,
                                   const torch::Tensor& b, const torch::Tensor& sfb,
                                   const torch::Tensor& d,
                                   const int& m, const int& n, const int& k,
@@ -88,7 +86,7 @@ static void sm100_mxfp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& s
         .cd_dtype = d.scalar_type(),
         .major_a = cute::UMMA::Major::K, .major_b = cute::UMMA::Major::K,
         .with_accumulation = false,
-        .mma_kind = MmaKind::MXFP4,
+        .mma_kind = MmaKind::NVFP4,
         .num_sms = device_runtime->get_num_sms(),
         .tc_util = device_runtime->get_tc_util(),
         .compiled_dims = compiled_dims
@@ -110,19 +108,14 @@ static void sm100_mxfp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& s
                                                 config.storage_config.store_block_n,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
-    const auto tensor_map_cd_n64 = make_tma_cd_desc(d, m, n,
-                                                    config.storage_config.store_block_m,
-                                                    64,
-                                                    static_cast<int>(d.stride(-2)), 1,
-                                                    128);
     const auto [sf_block_m, sf_block_n] = SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(
-        config.layout.block_m, config.layout.block_n, MmaKind::MXFP4);
+        config.layout.block_m, config.layout.block_n, MmaKind::NVFP4);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 sf_block_m, 32, 1, 0, 0, false, 2);
+                                                 sf_block_m, 16, 1, 0, 0, false, 4);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                 sf_block_n, 32, 1, 0, 0, false, 2);
+                                                 sf_block_n, 16, 1, 0, 0, false, 4);
 
-    const SM100MXFP4Gemm1D1DRuntime::Args args = {
+    const SM100NVFP4Gemm1D1DRuntime::Args args = {
         .gemm_desc = desc,
         .gemm_config = config,
         .launch_args = LaunchArgs(config.launch_config.num_sms, config.launch_config.num_threads,
@@ -133,12 +126,11 @@ static void sm100_mxfp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& s
         .tensor_map_b = tensor_map_b,
         .tensor_map_sfa = tensor_map_sfa,
         .tensor_map_sfb = tensor_map_sfb,
-        .tensor_map_cd_n64 = tensor_map_cd_n64,
         .tensor_map_cd = tensor_map_cd
     };
-    const auto code = SM100MXFP4Gemm1D1DRuntime::generate(args);
-    const auto runtime = compiler->build("sm100_mxfp4_gemm_1d1d", code);
-    SM100MXFP4Gemm1D1DRuntime::launch(runtime, args);
+    const auto code = SM100NVFP4Gemm1D1DRuntime::generate(args);
+    const auto runtime = compiler->build("sm100_nvfp4_gemm_1d1d", code);
+    SM100NVFP4Gemm1D1DRuntime::launch(runtime, args);
 }
 
 } // namespace deep_gemm

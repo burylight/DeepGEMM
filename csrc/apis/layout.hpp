@@ -59,6 +59,24 @@ static torch::Tensor transform_sf_into_required_layout(const torch::Tensor& sf,
     DG_HOST_UNREACHABLE("Unknown SF transformation");
 }
 
+static torch::Tensor transform_sf_into_required_layout_nvfp4(const torch::Tensor& sf,
+                                                             const int& mn, const int& k) {
+    const auto arch_major = device_runtime->get_arch_major();
+    DG_HOST_ASSERT(arch_major == 10);
+
+    constexpr int gran_mn = 1;
+    constexpr int gran_k = 16;
+    check_sf_layout(sf, mn, k, gran_mn, gran_k, std::nullopt);
+
+    if (sf.scalar_type() == torch::kFloat)
+        return get_mn_major_tma_aligned_packed_ue4m3_tensor(sf);
+
+    if (sf.scalar_type() == torch::kInt)
+        return check_sf_layout(sf, mn, k, gran_mn, gran_k, std::nullopt, true, false, torch::kInt);
+
+    DG_HOST_UNREACHABLE("Unknown NVFP4 SF transformation");
+}
+
 static std::tuple<torch::Tensor, torch::Tensor, int, int> transform_sf_pair_into_required_layout(
         const torch::Tensor& sfa, const torch::Tensor& sfb,
         const int& m, const int& n, const int& k,
@@ -126,7 +144,10 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_tma_aligned_size", &get_tma_aligned_size);
     m.def("get_mn_major_tma_aligned_tensor", &get_mn_major_tma_aligned_tensor);
     m.def("get_mn_major_tma_aligned_packed_ue8m0_tensor", &get_mn_major_tma_aligned_packed_ue8m0_tensor);
+    m.def("get_mn_major_tma_aligned_packed_ue4m3_tensor", &get_mn_major_tma_aligned_packed_ue4m3_tensor);
     m.def("get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor", &get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor);
+    m.def("transform_sf_into_required_layout_nvfp4", &transform_sf_into_required_layout_nvfp4,
+          py::arg("sf"), py::arg("mn"), py::arg("k"));
 #endif
 
     m.def("set_mk_alignment_for_contiguous_layout", [&](const int& new_value) {

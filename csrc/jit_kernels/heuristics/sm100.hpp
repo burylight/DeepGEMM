@@ -21,12 +21,13 @@ struct SM100ArchSpec {
             case MmaKind::BF16: return {0, 0};
             case MmaKind::MXFP8FP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             case MmaKind::MXFP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
+            case MmaKind::NVFP4: return {align(block_m, num_utccp_aligned_elems), align(block_n, num_utccp_aligned_elems)};
             default: DG_HOST_UNREACHABLE("Unknown dtype");
         }
     }
 
     static std::vector<Layout> get_layout_candidates(const GemmDesc& desc) {
-        if (desc.get_mma_kind() == MmaKind::MXFP4) {
+        if (desc.get_mma_kind() == MmaKind::MXFP4 or desc.get_mma_kind() == MmaKind::NVFP4) {
             DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal);
             DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
             DG_HOST_ASSERT(not desc.with_accumulation);
@@ -175,7 +176,7 @@ struct SM100ArchSpec {
         const auto store_block_m = layout.swap_ab ? umma_step_n : std::min(layout_ad_m, layout.block_m);
         const auto store_block_n = layout.block_n;
 
-        if (desc.get_mma_kind() == MmaKind::MXFP4) {
+        if (desc.get_mma_kind() == MmaKind::MXFP4 or desc.get_mma_kind() == MmaKind::NVFP4) {
             return {
                 load_block_m, load_block_n,
                 store_block_m, store_block_n,
@@ -203,8 +204,14 @@ struct SM100ArchSpec {
         constexpr int kNumMaxStages = 32;
 
         // C/D for TMA stores
+        const bool use_mxfp4_mixed_cd_store =
+            desc.get_mma_kind() == MmaKind::MXFP4 and
+            desc.cd_dtype == torch::kBFloat16 and
+            storage_config.swizzle_cd_mode == 64 and
+            layout.block_n % 64 == 32;
+        const int smem_cd_swizzle_mode = use_mxfp4_mixed_cd_store ? 128 : storage_config.swizzle_cd_mode;
         const int smem_cd = layout.swap_ab ? storage_config.store_block_m * storage_config.store_block_n * c10::elementSize(desc.cd_dtype) * 2
-                                           : storage_config.store_block_m * storage_config.swizzle_cd_mode * 2;
+                                           : storage_config.store_block_m * smem_cd_swizzle_mode * 2;
 
         // TODO: remove SF barriers for BF16 GEMMs
         // TMA full/empty barriers, with-SF full barriers, tensor memory full/empty barriers
@@ -217,10 +224,10 @@ struct SM100ArchSpec {
 
         // Calculate A/B per stages
         // TODO: consider FP4
-        const int smem_a_per_stage = desc.get_mma_kind() == MmaKind::MXFP4 ?
+        const int smem_a_per_stage = (desc.get_mma_kind() == MmaKind::MXFP4 or desc.get_mma_kind() == MmaKind::NVFP4) ?
             storage_config.load_block_m * layout.block_k / 2:
             storage_config.load_block_m * layout.block_k * c10::elementSize(desc.a_dtype);
-        const int smem_b_per_stage = desc.get_mma_kind() == MmaKind::MXFP4 ?
+        const int smem_b_per_stage = (desc.get_mma_kind() == MmaKind::MXFP4 or desc.get_mma_kind() == MmaKind::NVFP4) ?
             storage_config.load_block_n * layout.block_k / 2:
             storage_config.load_block_n * layout.block_k * c10::elementSize(desc.b_dtype);
 
@@ -230,7 +237,8 @@ struct SM100ArchSpec {
         if (desc.kernel_type == KernelType::Kernel1D1D) {
             const auto [sf_block_m, sf_block_n] = get_sf_uttcp_aligned_block_sizes(
                 layout.block_m, layout.block_n, desc.get_mma_kind());
-            const int sf_cols_per_stage = desc.get_mma_kind() == MmaKind::MXFP4 ? 2 : 1;
+            const int sf_cols_per_stage = desc.get_mma_kind() == MmaKind::NVFP4 ? 4 :
+                                          desc.get_mma_kind() == MmaKind::MXFP4 ? 2 : 1;
             smem_sfa_per_stage = sf_block_m * sf_cols_per_stage * 4;
             smem_sfb_per_stage = sf_block_n * sf_cols_per_stage * 4;
         }

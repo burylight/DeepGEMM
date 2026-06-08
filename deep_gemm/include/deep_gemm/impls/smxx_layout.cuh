@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cutlass/float8.h>
+
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
@@ -15,6 +17,16 @@ CUTLASS_DEVICE uint32_t ceil_fp32_bits_to_ue8m0(const uint32_t& value) {
     exp = exp < 1u ? 1u : exp;
     exp = exp > 254u ? 254u : exp;
     return exp;
+}
+
+CUTLASS_DEVICE uint32_t fp32_bits_to_ue4m3(const uint32_t& value) {
+    union {
+        uint32_t u;
+        float f;
+    } caster {value};
+    if (not (caster.f > 0.0f))
+        return 0;
+    return static_cast<uint32_t>(cutlass::float_ue4m3_t(caster.f).raw());
 }
 
 template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K,
@@ -113,6 +125,55 @@ CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue8m0(float* sf, uint32_t* out,
         packed |= ceil_fp32_bits_to_ue8m0(values[1]) << 8u;
         packed |= ceil_fp32_bits_to_ue8m0(values[2]) << 16u;
         packed |= ceil_fp32_bits_to_ue8m0(values[3]) << 24u;
+        if (const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx; global_mn_idx < mn)
+            out[sf_k_pack_idx * tma_aligned_mn + global_mn_idx] = packed;
+    }
+}
+
+template <uint32_t kNumThreads, uint32_t BLOCK_MN, uint32_t SF_K>
+CUTLASS_GLOBAL void transpose_and_pack_fp32_into_ue4m3(float* sf, uint32_t* out, const uint32_t mn) {
+    extern __shared__ uint32_t smem_buffer[];
+
+    constexpr auto kNumPackedSFK = math::constexpr_ceil_div(SF_K, 4u);
+    constexpr auto kNumTMAAlignedElems = static_cast<uint32_t>(16 / sizeof(int));
+    const auto in_block_mn = min(BLOCK_MN, mn - blockIdx.x * BLOCK_MN);
+    const auto tma_aligned_mn = math::align<uint64_t>(mn, kNumTMAAlignedElems);
+
+    sf = sf + static_cast<uint64_t>(blockIdx.y) * mn * SF_K;
+    out = out + static_cast<uint64_t>(blockIdx.y) * tma_aligned_mn * kNumPackedSFK;
+
+    cudaGridDependencySynchronize();
+
+    DG_STATIC_ASSERT(BLOCK_MN % 4 == 0, "Invalid block size");
+    const auto local_sf = reinterpret_cast<uint32_t*>(sf + static_cast<uint64_t>(blockIdx.x) * (BLOCK_MN * SF_K));
+    const auto num_values = in_block_mn * SF_K;
+    const auto num_uint4 = num_values / 4;
+    #pragma unroll
+    for (uint32_t i = threadIdx.x; i < num_uint4; i += kNumThreads) {
+        const auto& [x, y, z, w] = reinterpret_cast<const uint4*>(local_sf)[i];
+        ptx::st_shared(reinterpret_cast<uint4*>(smem_buffer) + i, x, y, z, w);
+    }
+
+    if (const auto unaligned_idx = num_uint4 * 4 + threadIdx.x; unaligned_idx < num_values)
+        ptx::st_shared(smem_buffer + unaligned_idx, local_sf[unaligned_idx]);
+    __syncthreads();
+
+    #pragma unroll
+    for (uint32_t i = threadIdx.x; i < (kNumPackedSFK * BLOCK_MN); i += kNumThreads) {
+        const auto sf_k_pack_idx = i / BLOCK_MN, mn_idx = i % BLOCK_MN;
+
+        uint32_t values[4];
+        #pragma unroll
+        for (uint32_t j = 0; j < 4; ++ j) {
+            const auto sf_k_idx = sf_k_pack_idx * 4 + j;
+            values[j] = sf_k_idx < SF_K ? ptx::ld_shared(smem_buffer + mn_idx * SF_K + sf_k_idx) : 0;
+        }
+
+        uint32_t packed = 0;
+        packed |= fp32_bits_to_ue4m3(values[0]);
+        packed |= fp32_bits_to_ue4m3(values[1]) << 8u;
+        packed |= fp32_bits_to_ue4m3(values[2]) << 16u;
+        packed |= fp32_bits_to_ue4m3(values[3]) << 24u;
         if (const auto global_mn_idx = blockIdx.x * BLOCK_MN + mn_idx; global_mn_idx < mn)
             out[sf_k_pack_idx * tma_aligned_mn + global_mn_idx] = packed;
     }

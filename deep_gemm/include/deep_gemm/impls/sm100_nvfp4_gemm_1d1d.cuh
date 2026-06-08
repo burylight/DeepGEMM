@@ -25,18 +25,17 @@ template <uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
           typename cd_dtype_t,
           typename epilogue_type_t>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
-sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+sm100_nvfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_b,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
-                           const __grid_constant__ cute::TmaDescriptor tensor_map_cd_n64,
                            const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
 
-    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "MXFP4 GEMM only supports BF16 output");
+    DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "NVFP4 GEMM only supports BF16 output");
 
     constexpr uint32_t LAYOUT_AD_M = 128;
     constexpr uint32_t UMMA_M = LAYOUT_AD_M * kNumMulticast;
@@ -48,27 +47,23 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     DG_STATIC_ASSERT(BLOCK_N % 16 == 0 and 16 <= BLOCK_N and BLOCK_N <= 256, "Invalid block N");
     DG_STATIC_ASSERT(BLOCK_K == 256, "Invalid block K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
-    DG_STATIC_ASSERT(kNumMulticast == 1 or not kIsMulticastOnA, "MXFP4 2SM only supports M clustering");
-    DG_STATIC_ASSERT(kSwizzleAMode == 128 and kSwizzleBMode == 128, "MXFP4 operands require 128B swizzle");
+    DG_STATIC_ASSERT(kNumMulticast == 1 or not kIsMulticastOnA, "NVFP4 2SM only supports M clustering");
+    DG_STATIC_ASSERT(kSwizzleAMode == 128 and kSwizzleBMode == 128, "NVFP4 operands require 128B swizzle");
 
     constexpr uint32_t kNumUTCCPAlignedElems = 128;
     constexpr uint32_t SF_BLOCK_M = math::constexpr_align(BLOCK_M, kNumUTCCPAlignedElems);
     constexpr uint32_t SF_BLOCK_N = math::constexpr_align(BLOCK_N, kNumUTCCPAlignedElems);
-    constexpr uint32_t kNumSFWordsPerStage = BLOCK_K / 128;
-    DG_STATIC_ASSERT(kNumSFWordsPerStage == 2, "MXFP4 block K requires two packed scale columns");
+    constexpr uint32_t kNumSFWordsPerStage = BLOCK_K / 64;
+    DG_STATIC_ASSERT(kNumSFWordsPerStage == 4, "NVFP4 block K requires four packed scale columns");
 
     constexpr uint32_t kNumEpilogueStages = BLOCK_N == 256 ? 1 : 2;
     constexpr uint32_t kNumTMAStoreStages = 2;
     constexpr uint32_t STORE_BLOCK_M = cute::min<uint32_t>(BLOCK_M, LAYOUT_AD_M);
     constexpr uint32_t STORE_BLOCK_N = kSwizzleCDMode / sizeof(cd_dtype_t);
     constexpr uint32_t kNumUMMAStoreThreads = STORE_BLOCK_M;
-    constexpr bool kUseMixedCDStore = cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t> and
-                                      kSwizzleCDMode == 64 and
-                                      (BLOCK_N % 64 == 32);
     DG_STATIC_ASSERT(kNumUMMAStoreThreads % 32 == 0, "Invalid store block M");
 
-    constexpr uint32_t SMEM_CD_SWIZZLE_BYTES = kUseMixedCDStore ? 128 : kSwizzleCDMode;
-    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * SMEM_CD_SWIZZLE_BYTES;
+    constexpr uint32_t SMEM_CD_SIZE_PER_STAGE = STORE_BLOCK_M * STORE_BLOCK_N * sizeof(cd_dtype_t);
     constexpr uint32_t SMEM_CD_SIZE = SMEM_CD_SIZE_PER_STAGE * kNumTMAStoreStages;
     constexpr uint32_t SMEM_A_SIZE_PER_STAGE = LOAD_BLOCK_M * BLOCK_K / 2;
     constexpr uint32_t SMEM_B_SIZE_PER_STAGE = LOAD_BLOCK_N * BLOCK_K / 2;
@@ -96,8 +91,6 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
         cute::prefetch_tma_descriptor(&tensor_map_b);
         cute::prefetch_tma_descriptor(&tensor_map_sfa);
         cute::prefetch_tma_descriptor(&tensor_map_sfb);
-        if constexpr (kUseMixedCDStore)
-            cute::prefetch_tma_descriptor(&tensor_map_cd_n64);
         cute::prefetch_tma_descriptor(&tensor_map_cd);
     }
 
@@ -138,7 +131,7 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
         for (uint32_t i = 0; i < kNumStages; ++ i) {
             full_barriers[i]->init(1);
             empty_barriers[i]->init(1);
-            with_sf_full_barriers[i]->init(kNumMulticast * 32);
+            with_sf_full_barriers[i]->init(kNumMulticast * 64);
         }
         #pragma unroll
         for (uint32_t i = 0; i < kNumEpilogueStages; ++ i) {
@@ -154,7 +147,7 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     cudaGridDependencySynchronize();
 
     uint32_t m_block_idx, n_block_idx;
-    auto scheduler = sched::Scheduler<GemmType::Normal, BLOCK_M, BLOCK_N, 1, kNumMulticast, kIsMulticastOnA, kNumSMs, 128>(
+    auto scheduler = sched::Scheduler<GemmType::Normal, BLOCK_M, BLOCK_N, 1, kNumMulticast, kIsMulticastOnA, kNumSMs, 64>(
         shape_m, shape_n, shape_k, nullptr);
 
     uint32_t stage_idx = 0, phase = 0;
@@ -185,7 +178,7 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                 tma::copy_packed_fp4<BLOCK_K, LOAD_BLOCK_N, kSwizzleBMode>(
                     &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_load_idx);
 
-                uint32_t sf_k_idx = math::ceil_div(k_idx, 128u);
+                uint32_t sf_k_idx = math::ceil_div(k_idx, 64u);
                 tma::copy<SF_BLOCK_M, kNumSFWordsPerStage, 0>(
                     &tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], m_idx, sf_k_idx);
                 tma::copy<SF_BLOCK_N, kNumSFWordsPerStage, 0>(
@@ -200,7 +193,7 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
         }
     } else if (warp_idx == 1 and is_leader_cta) {
         auto instr_desc = cute::UMMA::make_instr_desc_block_scaled<
-            cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue8m0_t,
+            cutlass::float_e2m1_t, cutlass::float_e2m1_t, float, cutlass::float_ue4m3_t,
             UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
         auto sf_desc = mma::sm100::make_sf_desc(nullptr);
 
@@ -267,15 +260,14 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
 
                     #pragma unroll
                     for (uint32_t k64_idx = 0; k64_idx < BLOCK_K / UMMA_K; ++ k64_idx) {
-                        const uint32_t sf_word_col = k64_idx / 2;
-                        const uint32_t sf_half_id = (k64_idx % 2) * 2;
+                        const uint32_t sf_word_col = k64_idx;
                         const auto runtime_instr_desc =
-                            mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, sf_half_id, sf_half_id);
+                            mma::sm100::make_runtime_instr_desc_with_sf_id(instr_desc, 0, 0);
 
                         a_desc.lo = a_desc_base_lo + (k64_idx * (UMMA_K / 2)) / 16;
                         b_desc.lo = b_desc_base_lo + (k64_idx * (UMMA_K / 2)) / 16;
                         using mma_t = cute::conditional_t<
-                            kNumMulticast == 1, ptx::SM100_MMA_MXF4_SS, ptx::SM100_MMA_MXF4_2x1SM_SS>;
+                            kNumMulticast == 1, ptx::SM100_MMA_MXF4NVF4_SS, ptx::SM100_MMA_MXF4NVF4_2x1SM_SS>;
                         mma_t::fma(
                             a_desc, b_desc, accum_stage_idx * UMMA_N,
                             k_block_idx > 0 or k64_idx > 0, runtime_instr_desc,
@@ -288,17 +280,15 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                 empty_barrier_arrive(k_block_idx == num_total_k_blocks - 1);
             }
         }
-    } else if (warp_idx == 2) {
+    } else if (warp_idx == 2 or warp_idx == 3) {
         auto utccp_required_smem_warp_transpose = [&](const uint32_t* smem_ptr) {
             DG_STATIC_ASSERT(kNumUTCCPAlignedElems == 128, "Invalid aligned elements");
             uint32_t values[4];
             #pragma unroll
             for (uint32_t i = 0; i < 4; ++ i)
-                values[i] = ptx::ld_shared(smem_ptr + (i ^ (lane_idx >> 3)) * 32 + lane_idx);
+                values[i] = ptx::ld_shared(smem_ptr + i * 32 + lane_idx);
             __syncwarp();
-            #pragma unroll
-            for (uint32_t i = 0; i < 4; ++ i)
-                ptx::st_shared(smem_ptr + lane_idx * 4 + (i ^ (lane_idx >> 3)), values[i]);
+            ptx::st_shared(smem_ptr + lane_idx * 4, values[0], values[1], values[2], values[3]);
         };
 
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -308,16 +298,18 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
 
                 #pragma unroll
                 for (uint32_t sf_word_col = 0; sf_word_col < kNumSFWordsPerStage; ++ sf_word_col) {
-                    #pragma unroll
-                    for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
-                        utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + sf_word_col * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
-                    cutlass::arch::fence_view_async_shared();
-                    #pragma unroll
-                    for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
-                        utccp_required_smem_warp_transpose(smem_sfb[stage_idx] + sf_word_col * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
-                    cutlass::arch::fence_view_async_shared();
+                    if (warp_idx == 2) {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < SF_BLOCK_M / kNumUTCCPAlignedElems; ++ i)
+                            utccp_required_smem_warp_transpose(smem_sfa[stage_idx] + sf_word_col * SF_BLOCK_M + i * kNumUTCCPAlignedElems);
+                    } else {
+                        #pragma unroll
+                        for (uint32_t i = 0; i < SF_BLOCK_N / kNumUTCCPAlignedElems; ++ i)
+                            utccp_required_smem_warp_transpose(smem_sfb[stage_idx] + sf_word_col * SF_BLOCK_N + i * kNumUTCCPAlignedElems);
+                    }
                 }
 
+                cutlass::arch::fence_view_async_shared();
                 with_sf_full_barriers[stage_idx]->arrive(0u);
             }
         }
@@ -337,29 +329,16 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
             const auto base_m_idx = m_block_idx * BLOCK_M;
             const auto base_n_idx = n_block_idx * BLOCK_N;
 
-            if constexpr (kUseMixedCDStore) {
-                epilogue::sm100_store_cd_bf16_n64_tail_n32<
-                    BLOCK_M, BLOCK_N, STORE_BLOCK_M,
-                    kNumTMAStoreStages, kNumUMMAStoreThreads,
-                    GemmType::Normal,
-                    cd_dtype_t, epilogue_type_t>
-                (smem_cd, tma_stage_idx, tmem_base_addr,
-                 base_m_idx, base_n_idx, 0,
-                 epilogue_warp_idx, lane_idx,
-                 tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd_n64, tensor_map_cd);
-            } else {
-                epilogue::sm100_store_cd<
-                    BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
-                    kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
-                    GemmType::Normal, false,
-                    cd_dtype_t, epilogue_type_t>
-                (smem_cd, tma_stage_idx, tmem_base_addr,
-                 base_m_idx, base_n_idx, 0,
-                 epilogue_warp_idx, lane_idx,
-                 tmem_empty_barriers[accum_stage_idx],
-                 tensor_map_cd);
-            }
+            epilogue::sm100_store_cd<
+                BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+                GemmType::Normal, false,
+                cd_dtype_t, epilogue_type_t>
+            (smem_cd, tma_stage_idx, tmem_base_addr,
+             base_m_idx, base_n_idx, 0,
+             epilogue_warp_idx, lane_idx,
+             tmem_empty_barriers[accum_stage_idx],
+             tensor_map_cd);
         }
     }
 

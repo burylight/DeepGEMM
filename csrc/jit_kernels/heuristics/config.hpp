@@ -41,7 +41,7 @@ struct GemmDesc {
         const auto inferred_mma_kind = get_mma_kind();
         if (inferred_mma_kind == MmaKind::BF16) {
             DG_HOST_ASSERT(a_dtype == torch::kBFloat16 and b_dtype == torch::kBFloat16);
-        } else if (inferred_mma_kind == MmaKind::MXFP4) {
+        } else if (inferred_mma_kind == MmaKind::MXFP4 or inferred_mma_kind == MmaKind::NVFP4) {
             DG_HOST_ASSERT((a_dtype == kPackedFP4 or a_dtype == torch::kByte) and
                            (b_dtype == kPackedFP4 or b_dtype == torch::kByte));
         } else {

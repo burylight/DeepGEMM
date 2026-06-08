@@ -22,6 +22,32 @@ def pack_ue8m0_to_int(x: torch.Tensor):
     return (x.view(torch.int) >> 23).to(torch.uint8).view(torch.int)
 
 
+def _ue4m3_values(device: torch.device) -> torch.Tensor:
+    codes = torch.arange(0, 0x7F, device=device, dtype=torch.int32)
+    exp = (codes >> 3) & 0x0F
+    mant = codes & 0x07
+    normal = (1.0 + mant.float() / 8.0) * torch.pow(2.0, (exp - 7).float())
+    subnormal = mant.float() * (2.0 ** -9)
+    return torch.where(exp == 0, subnormal, normal)
+
+
+def _quantize_to_ue4m3(x: torch.Tensor) -> torch.Tensor:
+    values = _ue4m3_values(x.device)
+    boundaries = (values[:-1] + values[1:]) * 0.5
+    codes = torch.bucketize(x.float().clamp(0.0, 448.0), boundaries)
+    return codes.to(torch.uint8)
+
+
+def round_to_ue4m3(x: torch.Tensor) -> torch.Tensor:
+    values = _ue4m3_values(x.device)
+    return values[_quantize_to_ue4m3(x).long()]
+
+
+def pack_ue4m3_to_int(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.float and x.size(-1) % 4 == 0
+    return _quantize_to_ue4m3(x).contiguous().view(torch.int)
+
+
 def per_token_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
                           use_packed_ue8m0: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2
@@ -101,6 +127,23 @@ def per_token_cast_to_fp4(x: torch.Tensor, use_ue8m0: bool, gran_k: int = 128,
     return packed[:, :n // 2].contiguous(), pack_ue8m0_to_int(sf) if use_packed_ue8m0 else sf
 
 
+def per_token_cast_to_nvfp4(x: torch.Tensor, use_packed_ue4m3: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    gran_k = 16
+    m, n = x.shape
+    assert n % 2 == 0
+    padded_n = align(n, gran_k)
+    x_padded = torch.zeros((m, padded_n), dtype=x.dtype, device=x.device)
+    x_padded[:, :n] = x
+    x_view = x_padded.view(m, -1, gran_k)
+    x_amax = x_view.abs().float().amax(dim=2).clamp_min(1e-4)
+    sf = round_to_ue4m3(x_amax / 6.0)
+    x_scaled = x_view * (1.0 / sf.unsqueeze(2))
+    codes = _quantize_to_fp4_e2m1(x_scaled).view(m, padded_n)
+    codes2 = codes.view(m, padded_n // 2, 2)
+    packed = (codes2[:, :, 0] & 0x0F) | ((codes2[:, :, 1] & 0x0F) << 4)
+    return packed[:, :n // 2].contiguous(), pack_ue4m3_to_int(sf) if use_packed_ue4m3 else sf
+
+
 def transpose_packed_fp4(a: torch.Tensor) -> torch.Tensor:
     assert a.dtype == torch.int8
     assert a.dim() == 2
@@ -128,6 +171,13 @@ def unpack_ue8m0_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
     return (packed_sf.view(torch.uint8).to(torch.int) << 23).view(torch.float)
 
 
+def unpack_ue4m3_from_int(packed_sf: torch.Tensor) -> torch.Tensor:
+    out_shape = list(packed_sf.shape)
+    out_shape[-1] *= 4
+    codes = packed_sf.contiguous().view(torch.uint8).view(out_shape)
+    return _ue4m3_values(packed_sf.device)[codes.long()]
+
+
 def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128,
                        use_packed_ue8m0: bool = False) -> torch.Tensor:
     m, n2 = packed.shape
@@ -141,3 +191,9 @@ def cast_back_from_fp4(packed: torch.Tensor, sf: torch.Tensor, gran_k: int = 128
     group_idx = torch.arange(n, device=packed.device) // gran_k
     x_restored = x_dequantized * sf[:, group_idx]
     return x_restored
+
+
+def cast_back_from_nvfp4(packed: torch.Tensor, sf: torch.Tensor, use_packed_ue4m3: bool = False) -> torch.Tensor:
+    if use_packed_ue4m3:
+        sf = unpack_ue4m3_from_int(sf)
+    return cast_back_from_fp4(packed, sf, gran_k=16)
