@@ -58,6 +58,17 @@ def test_mxfp4_gemm() -> None:
     print()
 
 
+def test_mxfp4_block_n_variants() -> None:
+    print('Testing MXFP4 block-N variants:')
+    try:
+        for block_n in (160, 192, 224):
+            deep_gemm.set_block_size_multiple_of((1, block_n))
+            run_case(256, block_n * 2, 256, use_packed_sf=True, use_uint8=True)
+    finally:
+        deep_gemm.set_block_size_multiple_of((1, 1))
+    print()
+
+
 if __name__ == '__main__':
     torch.manual_seed(0)
     random.seed(0)
@@ -66,3 +77,4 @@ if __name__ == '__main__':
     print(f' > {deep_gemm.__path__}\n')
 
     test_mxfp4_gemm()
+    test_mxfp4_block_n_variants()

@@ -108,10 +108,12 @@ static void sm100_mxfp4_gemm_1d1d(const torch::Tensor& a, const torch::Tensor& s
                                                 config.storage_config.store_block_n,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
+    const auto [sf_block_m, sf_block_n] = SM100ArchSpec::get_sf_uttcp_aligned_block_sizes(
+        config.layout.block_m, config.layout.block_n, MmaKind::MXFP4);
     const auto tensor_map_sfa = make_tma_sf_desc(cute::UMMA::Major::MN, sfa, m, k,
-                                                 config.layout.block_m, 32, 1, 0, 0, false, 2);
+                                                 sf_block_m, 32, 1, 0, 0, false, 2);
     const auto tensor_map_sfb = make_tma_sf_desc(cute::UMMA::Major::MN, sfb, n, k,
-                                                 config.layout.block_n, 32, 1, 0, 0, false, 2);
+                                                 sf_block_n, 32, 1, 0, 0, false, 2);
 
     const SM100MXFP4Gemm1D1DRuntime::Args args = {
         .gemm_desc = desc,

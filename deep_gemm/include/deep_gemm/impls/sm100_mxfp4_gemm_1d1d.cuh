@@ -44,7 +44,7 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
     constexpr uint32_t LOAD_BLOCK_M = BLOCK_M / (kIsMulticastOnA ? kNumMulticast : 1);
     constexpr uint32_t LOAD_BLOCK_N = BLOCK_N / (kIsMulticastOnA ? 1 : kNumMulticast);
     DG_STATIC_ASSERT(BLOCK_M == 128, "Invalid block M");
-    DG_STATIC_ASSERT(BLOCK_N == 128 or BLOCK_N == 256, "Invalid block N");
+    DG_STATIC_ASSERT(BLOCK_N % 16 == 0 and 16 <= BLOCK_N and BLOCK_N <= 256, "Invalid block N");
     DG_STATIC_ASSERT(BLOCK_K == 256, "Invalid block K");
     DG_STATIC_ASSERT(kNumMulticast == 1 or kNumMulticast == 2, "Only support 1/2 multicast");
     DG_STATIC_ASSERT(kNumMulticast == 1 or not kIsMulticastOnA, "MXFP4 2SM only supports M clustering");
@@ -179,15 +179,15 @@ sm100_mxfp4_gemm_1d1d_impl(uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                     &tensor_map_b, full_barriers[stage_idx], smem_b[stage_idx], k_idx, n_load_idx);
 
                 uint32_t sf_k_idx = math::ceil_div(k_idx, 128u);
-                tma::copy<BLOCK_M, kNumSFWordsPerStage, 0>(
+                tma::copy<SF_BLOCK_M, kNumSFWordsPerStage, 0>(
                     &tensor_map_sfa, full_barriers[stage_idx], smem_sfa[stage_idx], m_idx, sf_k_idx);
-                tma::copy<BLOCK_N, kNumSFWordsPerStage, 0>(
+                tma::copy<SF_BLOCK_N, kNumSFWordsPerStage, 0>(
                     &tensor_map_sfb, full_barriers[stage_idx], smem_sfb[stage_idx], n_idx, sf_k_idx);
 
                 constexpr uint32_t num_arrival_bytes =
                     SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE +
-                    BLOCK_M * kNumSFWordsPerStage * sizeof(uint32_t) +
-                    BLOCK_N * kNumSFWordsPerStage * sizeof(uint32_t);
+                    SF_BLOCK_M * kNumSFWordsPerStage * sizeof(uint32_t) +
+                    SF_BLOCK_N * kNumSFWordsPerStage * sizeof(uint32_t);
                 full_barriers[stage_idx]->arrive_and_expect_tx(num_arrival_bytes);
             }
         }

@@ -30,14 +30,16 @@ struct SM100ArchSpec {
             DG_HOST_ASSERT(desc.gemm_type == GemmType::Normal);
             DG_HOST_ASSERT(desc.major_a == cute::UMMA::Major::K and desc.major_b == cute::UMMA::Major::K);
             DG_HOST_ASSERT(not desc.with_accumulation);
-            std::vector<Layout> candidates = {
-                Layout{false, 128, 128, 256, 1, 1},
-                Layout{false, 128, 256, 256, 1, 1},
-            };
-            if (desc.num_sms % 2 == 0 and desc.get_expected_n() >= 256 and
-                ceil_div(desc.get_expected_m(), 128) % 2 == 0) {
-                candidates.push_back(Layout{false, 128, 256, 256, 2, 1});
+            std::vector<Layout> candidates;
+            const int block_n_step = std::lcm(32, heuristics_runtime->get_block_n_multiple_of());
+            for (int block_n = std::max(128, block_n_step); block_n <= 256; block_n += block_n_step) {
+                candidates.push_back(Layout{false, 128, block_n, 256, 1, 1});
+                if (desc.num_sms % 2 == 0 and desc.get_expected_n() >= block_n and
+                    ceil_div(desc.get_expected_m(), 128) % 2 == 0) {
+                    candidates.push_back(Layout{false, 128, block_n, 256, 2, 1});
+                }
             }
+            DG_HOST_ASSERT(not candidates.empty());
             return candidates;
         }
 
